@@ -1,1 +1,112 @@
+#include <stdio.h>
+#include <string.h>
+#include "driver/gpio.h"
+#include "driver/adc.h"
+#include "esp_adc_cal.h"
+#include "driver/uart.h"
+#include "driver/touch_pad.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
+// Configuración
+#define TOUCH_PIN TOUCH_PAD_NUM8   // GPIO33
+#define UART_PORT UART_NUM_0
+#define BAUD_RATE 115200
+#define ADC_PIN ADC1_CHANNEL_6     // GPIO34
+#define DELAY_MS 1000              // 1 segundo de espera
+#define TOUCH_THRESHOLD 30         // Umbral para detección de toque
+
+static esp_adc_cal_characteristics_t *adc_chars;
+
+void setup_adc() {
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(ADC_PIN, ADC_ATTEN_DB_11);
+    
+    adc_chars = calloc(1, sizeof(esp_adc_cal_characteristics_t));
+    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, adc_chars);
+}
+
+void setup_serial() {
+    uart_config_t uart_config = {
+        .baud_rate = BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT
+    };
+    uart_param_config(UART_PORT, &uart_config);
+    uart_driver_install(UART_PORT, 1024, 0, 0, NULL, 0);
+    
+    // Mensaje inicial de instrucciones
+    printf("\n\n=== Sistema de Lectura ADC ===\n");
+    printf("1. Escriba '1' y presione Enter\n");
+    printf("2. Luego toque el sensor capacitivo\n");
+    printf("===============================\n\n");
+}
+
+bool wait_for_user_input() {
+    uint8_t data[3];
+    printf("Por favor ingrese '1' + Enter: ");
+    
+    while(1) {
+        int length = uart_read_bytes(UART_PORT, data, sizeof(data), 100 / portTICK_PERIOD_MS);
+        if(length > 0) {
+            if(data[0] == '1' && (data[1] == '\r' || data[1] == '\n')) {
+                printf("\nComando recibido. Por favor toque el sensor...\n");
+                return true;
+            } else {
+                printf("\nEntrada incorrecta. Por favor ingrese '1' + Enter: ");
+            }
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
+bool is_touch_pressed() {
+    uint16_t touch_value;
+    if(touch_pad_read(TOUCH_PIN, &touch_value) != ESP_OK) return false;
+    return touch_value < TOUCH_THRESHOLD;
+}
+
+void print_adc_values() {
+    int raw_value = adc1_get_raw(ADC_PIN);
+    int voltage = esp_adc_cal_raw_to_voltage(raw_value, adc_chars);
+    int percentage = (raw_value * 100) / 4095;
+    
+    // Imprimir en el formato: Voltaje (V) - Porcentaje%
+    printf("Valores ADC:\n");
+    printf(" - Voltaje: %.2f V\n", voltage / 1000.0);
+    printf(" - Porcentaje: %d%%\n\n", percentage);
+    
+    // También enviar por UART para otros clientes seriales
+    char buffer[64];
+    snprintf(buffer, sizeof(buffer), "%.2fV - %d%%\r\n", voltage/1000.0, percentage);
+    uart_write_bytes(UART_PORT, buffer, strlen(buffer));
+}
+
+void app_main() {
+    // Inicialización
+    setup_adc();
+    setup_serial();
+    
+    // Configurar touch pad
+    touch_pad_init();
+    touch_pad_config(TOUCH_PIN, 0);
+    
+    // Bucle principal
+    while(1) {
+        if(wait_for_user_input()) {
+            // Esperar toque del sensor
+            while(!is_touch_pressed()) {
+                vTaskDelay(10 / portTICK_PERIOD_MS);
+            }
+            
+            // Mostrar valores
+            print_adc_values();
+            
+            // Esperar 1 segundo
+            vTaskDelay(DELAY_MS / portTICK_PERIOD_MS);
+        }
+    }
+}
